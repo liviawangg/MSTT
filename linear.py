@@ -91,7 +91,6 @@ class PropagateSatelliteLinearMan():
         self.t1_truth = t1_truth
         self.dv_truth = np.asarray(dv_truth)
 
-        # Nominal orbit elements of the target and the observer in LEO testing case
         # Observer truth - no maneouvre
         a_obs = (observer_coe[0] + self.R_e) / (1.0 + observer_coe[1])
         # a_obs = observer_coe[0] + self.R_e
@@ -450,39 +449,3 @@ class PropagateSatelliteLinearMan():
                         - 7.0 * z * z * np.outer(r, r) * r9)
         )
         return result
-
-    def _residual(self, X):
-        """Measurement residual at an arbitrary parameter vector X.
-        Uses propagate_states (no STM/STT) - cheap, and the partials aren't needed."""
-        states = self.propagate_states(X[:3], X[3:6], dv=X[6:9], t1=self._clamp_t1(X[9]))
-        z_exp = np.empty((self.K, self.MEASUREMENT_DIM))
-        for j in range(self.K):
-            z_exp[j] = self.state_to_losvec(states[j], self.observer[j])
-        return (self.z_tau - z_exp).reshape(self.K * self.MEASUREMENT_DIM)
-
-    def diagnostics(self):
-        """Metric 3: is X_hat actually the weighted-LS minimum?
-           Metric 4: does the post-fit residual match the noise level?"""
-        X_truth = np.concatenate([self.target[0], self.dv_truth, [self.t1_truth]])
-
-        r_hat   = self._residual(self.X_i)
-        r_truth = self._residual(X_truth)
-        W       = self.W_final
-
-        J_hat   = r_hat   @ W @ r_hat
-        J_truth = r_truth @ W @ r_truth
-
-        # scaled gradient of J at X_hat: should be ~1e-8, not ~1e-2
-        g = self.Omega_final.T @ W @ r_hat
-        g_scaled = np.linalg.norm(g) / (np.linalg.norm(self.Omega_final)
-                                        * np.linalg.norm(W) * np.linalg.norm(r_hat))
-
-        n_meas = self.K * self.MEASUREMENT_DIM
-        resid_rms = np.sqrt(np.mean(r_hat**2))
-        resid_expected = self.sigma_noise * np.sqrt(1.0 - self.PARAM_DIM / n_meas)
-        chi2_red = (r_hat @ r_hat) / (self.sigma_noise**2 * (n_meas - self.PARAM_DIM))
-
-        return dict(J_hat=J_hat, J_truth=J_truth, J_ratio=J_hat / J_truth,
-                    grad=g_scaled, resid_rms=resid_rms,
-                    resid_expected=resid_expected, resid_ratio=resid_rms / resid_expected,
-                    chi2_red=chi2_red)

@@ -87,7 +87,6 @@ class PropagateSatelliteSecondMan():
         self.t1_truth = t1_truth
         self.dv_truth = np.asarray(dv_truth)
 
-        # Nominal orbit elements of the target and the observer in LEO testing case
         # Observer truth - no maneouvre
         a_obs = (observer_coe[0] + self.R_e) / (1.0 + observer_coe[1])
         r_obs, v_obs = coe_to_eci(self.mu_e, a_obs, observer_coe[1], *np.deg2rad(observer_coe[2:]))
@@ -117,8 +116,10 @@ class PropagateSatelliteSecondMan():
             t1_guess = 0.5 * (self.t0 + self.t2)
         self.X_i = np.concatenate([x0_init_guess, np.asarray(dv_guess, float), [float(t1_guess)]])
 
-        self.P_w      = P_0_init.copy()   # feeds the weight matrix
-        self.P_report = P_0_init.copy()   # reported uncertainty only, not fed back
+        # feeds the weight matrix
+        self.P_w      = P_0_init.copy()   
+        # reported uncertainty only, not iterated back
+        self.P_report = P_0_init.copy()
 
         # Covariance matrix 
         self.R_2 = self.sigma_noise**2 * np.eye(self.K * self.MEASUREMENT_DIM)
@@ -447,7 +448,8 @@ class PropagateSatelliteSecondMan():
             self.Sigma_final = Sigma
 
             # First order
-            S = self.tol_scale                                  # column scaling: km, km/s, s
+            # scaling: km, km/s, s
+            S = self.tol_scale                                  
             H_lin = Omega.T @ W @ Omega
             b_lin = Omega.T @ W @ delta_z
             delta_X_linear = S * np.linalg.solve(H_lin * np.outer(S, S), S * b_lin)
