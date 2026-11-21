@@ -1,4 +1,4 @@
-# MSTT
+# Tangent Plane LOS Measurement Representation for Orbit Determination and Manoeuvre Reconstruction
 
 Batch estimator for orbit determination and a **single impulsive manouevre** reconstruction of a target spacecraft, 
 observed by **line-of-sight (LOS) unit vectors** from an observer satellite. This program implements the first and 
