@@ -30,7 +30,14 @@ pip install numpy scipy
 | `second_order_2comp.py` | Proposed method, 2D tangent plane reformulation of 3D LOS measurement model, Second Order MSTT LSM | 
 | `linear.py` | 3D LOS representation, Linear MSTT LSM |
 | `calc_rmse_sum.py` | Given: estimator, orbit conditions and case; Provides a summary of statistics | 
+| `testing.py` | Examples of a single runs | 
 
+## How to Run
+To do a single run with one case, edit the parameters in `testing.py` and run using
+
+```bash
+python testing.py
+```
 
 ## Key Function Parameters
 
