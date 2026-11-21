@@ -27,7 +27,7 @@ pip install numpy scipy
 ## Key Files
 | File | Description |
 |---------|---------|
-| `second_order_2comp.py` | Proposed method, 2D tangent plane reformulation of 3D LOS measurement model, MSTT LSM | 
+| `second_order_2comp.py` | Proposed method, 2D tangent plane reformulation of 3D LOS measurement model, Second Order MSTT LSM | 
 | `linear.py` | 3D LOS representation, Linear MSTT LSM |
 | `calc_rmse_sum.py` | Given: estimator, orbit conditions and case; Provides a summary of statistics | 
 
