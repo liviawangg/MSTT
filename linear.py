@@ -1,3 +1,6 @@
+### Paper aligned implementation
+## Has short commings in sparse cases
+
 import numpy as np
 from scipy.integrate import solve_ivp
 
@@ -36,11 +39,9 @@ class PropagateSatelliteLinearMan():
     # -- Dimensions -- 
     STATE_DIM       = 6     # dynamical state [r, v]
     PARAM_DIM       = 10    # estimation vector [r, v, dv1, t1]
-    # MEASUREMENT_DIM = 2     # azimuth, elevation
     MEASUREMENT_DIM = 3     # 3-component LOS vector
 
     nu = 1e-3   # Convergence limit
-    i_max = 10  # Iteration limit
 
     sigma_noise = 1e-5 # Noise during simulation point generation
     R_meas = sigma_noise**2 * np.eye(MEASUREMENT_DIM)   # 2 x 2 measurement covariance matrix
@@ -67,16 +68,15 @@ class PropagateSatelliteLinearMan():
                  dv_truth=(0.010, 0.010, 0.010),   # km/s  (= 10 m/s per axis, Zhou)
                  dv_guess=(0.015, 0.015, 0.015),
                  t0 = 0,
-                 t2 = 1800,
-                 rdm_seed = 2,
+                 t2 = None,
+                 rdm_seed = 5,
                  record = False,
-                 j2_partials = True):
-
-        # if not (t0 < t1_truth < t2):
-        #     raise ValueError(f"t1_truth={t1_truth} outside arc [{t0}, {t2}]")
+                 j2_partials = True,
+                 i_max = 10):
 
         self.j2_partials = j2_partials
-
+        self.n_fallback = 0
+        self.i_max = i_max
         self.record = record
         self.time_split = time_split
         self.special_rec = []
@@ -84,22 +84,24 @@ class PropagateSatelliteLinearMan():
         random = np.random.default_rng(rdm_seed)
 
         self.K = num_measurement + 1
-        self.t_eval = np.arange(0, (self.K) * time_split, time_split)
-        self.t0 = self.t_eval[0]
-        self.t2 = self.t_eval[-1]
+        self.t0 = float(t0)
+        self.t_eval = self.t0 + np.arange(self.K, dtype=float) * time_split
+        self.t2 = float(self.t_eval[-1])
+        if t2 is not None and not np.isclose(self.t2, float(t2), atol=1e-9, rtol=0):
+            raise ValueError("t2 must equal t0 + num_measurement * time_split")
+        if not (self.t0 < t1_truth < self.t2):
+            raise ValueError("t1_truth must lie strictly inside the observation arc")
 
         self.t1_truth = t1_truth
         self.dv_truth = np.asarray(dv_truth)
 
-        # Observer truth - no maneouvre
+        # Observer truth - no manoevure
         a_obs = (observer_coe[0] + self.R_e) / (1.0 + observer_coe[1])
-        # a_obs = observer_coe[0] + self.R_e
         r_obs, v_obs = coe_to_eci(self.mu_e, a_obs, observer_coe[1], *np.deg2rad(observer_coe[2:]))
         self.observer = self.propagate_states(r_obs, v_obs)
 
-        # Target truth - with 
+        # Target truth - with manoevure
         a_tgt = (target_coe[0] + self.R_e) / (1.0 + target_coe[1])
-        # a_tgt = target_coe[0] + self.R_e
         r_tgt, v_tgt = coe_to_eci(self.mu_e, a_tgt, target_coe[1], *np.deg2rad(target_coe[2:]))
         self.target = self.propagate_states(r_tgt, v_tgt, dv=self.dv_truth, t1=self.t1_truth)
 
@@ -121,6 +123,7 @@ class PropagateSatelliteLinearMan():
         if t1_guess is None:
             t1_guess = 0.5 * (self.t0 + self.t2)
         self.X_i = np.concatenate([x0_init_guess, np.asarray(dv_guess, float), [float(t1_guess)]])
+        self.X_i[9] = self._clamp_t1(self.X_i[9])
 
         self.P_w      = P_0_init.copy()   # feeds the weight matrix
         self.P_report = P_0_init.copy()   # reported uncertainty only, not fed back
@@ -174,29 +177,6 @@ class PropagateSatelliteLinearMan():
 
     #y_ref first differential
     def calc_first_diff(self, x, t):
-        # epsilon = 1e-4
-        # r = x[:3]
-        # v = x[3:self.STATE_DIM]
-
-        # dadr = np.zeros((3, 3))
-
-        # for i in range(3):
-        #     dr = np.zeros(3)
-        #     dr[i] = epsilon
-
-        #     state_plus = np.concatenate([r + dr, v])
-        #     state_minus = np.concatenate([r - dr, v])
-
-        #     a_plus = self.dynamics(0, state_plus)[3:]
-        #     a_minus = self.dynamics(0, state_minus)[3:]
-
-        #     dadr[:, i] = (a_plus - a_minus) / (2 * epsilon)
-
-        # A = np.block([
-        #     [np.zeros((3, 3)), np.eye(3)],
-        #     [dadr, np.zeros((3, 3))]
-        # ])
-
         # Analytical solution
         r = x[:3]
         
@@ -274,7 +254,6 @@ class PropagateSatelliteLinearMan():
         y0_s1 = np.concatenate([r0, v0, I6.flatten()])
         te1 = np.unique(np.append(self.t_eval[pre], t1))
         sol1 = solve_ivp(self.combined_dynamics, [self.t0, t1], y0_s1, t_eval=te1, rtol=1e-9, atol=self.atol_stm, method='DOP853')
-        # sol1 = solve_ivp(self.combined_dynamics, [self.t0, t1], y0_s1, t_eval=te1, rtol=1e-9, atol=1e-11, method='DOP853')
         end1 = sol1.y[:, -1]
 
         x1_minus = end1[:self.STATE_DIM]
@@ -286,7 +265,6 @@ class PropagateSatelliteLinearMan():
         y0_s2 = np.concatenate([x1_plus, I6.flatten()])
         te2 = self.t_eval[~pre]
         sol2 = solve_ivp(self.combined_dynamics, [t1, self.t2], y0_s2, t_eval=te2, rtol=1e-9, atol=self.atol_stm, method='DOP853')
-        # sol2 = solve_ivp(self.combined_dynamics, [t1, self.t2], y0_s2, t_eval=te2, rtol=1e-9, atol=1e-11, method='DOP853')
         b_t1 = np.concatenate([-dv, np.zeros(3)]) # B1 = f- - f+
     
 
@@ -313,18 +291,6 @@ class PropagateSatelliteLinearMan():
 
     # Measurement Jacobian Eq. 32
     def calculate_U(self, x_target, x_observer, epsilon = 1e-4):
-        # Finite Difference
-        # U = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM))
-
-        # for i in range(3):  # Perturb each state component
-        #     dx = np.zeros(6)
-        #     dx[i] = epsilon
-
-        #     h_plus = self.state_to_losvec(x_target + dx, x_observer)
-        #     h_minus = self.state_to_losvec(x_target - dx, x_observer)
-
-        #     U[:, i] = (h_plus - h_minus) / (2 * epsilon)
-
         # Analytical Solution
         rel = x_target[:3] - x_observer[:3]
         rho = np.linalg.norm(rel)
@@ -332,11 +298,10 @@ class PropagateSatelliteLinearMan():
         U = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM))
         U[:, :3] = (np.eye(3) - np.outer(l, l)) / rho
         return U
-
-        return U
-
+    
     def do_calc(self, print_vals=True):
-        self.converged = False          
+        self.converged = False    
+        self.diverged = False      
         self.converged_i = 0
 
         # Print initial guess
@@ -368,16 +333,21 @@ class PropagateSatelliteLinearMan():
             md = self.MEASUREMENT_DIM
             for l in range(self.K):
                 # previous change -> P_i to P_w in this loop
-                P_w = np.einsum('ia, jq, aq -> ij', Omega[l, :, :], Omega[l, :, :], self.P_w) + self.R_meas
-                W[l * md:l * md + md, l * md:l * md + md] = P_w
+                P_k = np.einsum('ia, jq, aq -> ij', Omega[l], Omega[l], self.P_w) + self.R_meas
+                W[l * md:l * md + md, l * md:l * md + md] = P_k
+
             W = np.linalg.pinv(W)
             W = W / np.linalg.norm(W)
 
             # Estimator Step 
             Omega_f = Omega.reshape(self.K * self.MEASUREMENT_DIM, self.PARAM_DIM)
-            H = Omega_f.T @ W @ Omega_f
-            b = Omega_f.T @ W @ delta_z
-            delta_X_linear = np.linalg.lstsq(H, b, rcond=None)[0]
+            
+            # Scale columns before solving:
+            S = self.tol_scale
+            Om_s = Omega_f * S
+            H = Om_s.T @ W @ Om_s
+            b = Om_s.T @ W @ delta_z
+            delta_X_linear = S * np.linalg.lstsq(H, b, rcond=1e-14)[0]
             self.W_final = W
             self.Omega_final = Omega_f
 
@@ -385,15 +355,26 @@ class PropagateSatelliteLinearMan():
             self.X_i = self.X_i + delta_X_linear
             self.X_i[9] = self._clamp_t1(self.X_i[9])
 
-            # Covariance update
-            # P_dx = np.linalg.pinv(Omega_f.T @ W @ Omega_f) @ Omega_f.T @ W @ self.R_2 @ W.T @ Omega_f @ np.linalg.pinv(Omega_f.T @ W @ Omega_f)
-            # self.P_i = P_dx
-            Omega = Omega_f
-            Hinv = np.linalg.pinv(Omega.T @ W @ Omega)
-            self.P_w = Hinv @ Omega.T @ W @ self.R_2 @ W.T @ Omega @ Hinv
-            self.P_w = 0.5 * (self.P_w + self.P_w.T)
+            # Check Divergence
+            r_norm = np.linalg.norm(self.X_i[:3])
+            v_norm = np.linalg.norm(self.X_i[3:6])
+            if (not np.all(np.isfinite(self.X_i))) or r_norm > 1e6 or v_norm > 50.0:
+                self.diverged = True
+                self.diverged_i = i + 1
+                if print_vals:
+                    print(f"Diverged at iteration {i + 1} (|r|={r_norm:.3e} km, |v|={v_norm:.3e} km/s)")
+                return
 
-            self.P_report = self.P_w.copy()
+            # Covariance update 
+            S = self.tol_scale
+            Om_s = Omega_f * S
+            L_s = np.linalg.pinv(Om_s.T @ W @ Om_s) @ (Om_s.T @ W)
+            P_lin = self.sigma_noise**2 * (L_s @ L_s.T) * np.outer(S, S)
+
+            self.P_w = P_lin
+            self.P_lin = P_lin
+            self.P_report = P_lin
+
             # Record the iteration and difference in current estimated X_0 and actual initial guess
             if self.record:
                 self.results.append([i + 1, *self.X_i])
@@ -404,19 +385,20 @@ class PropagateSatelliteLinearMan():
                 print(f"{label:<14}" + "".join(f"{v:>10.4f}" for v in self._error_row(self.X_i)))
 
             # Convergence check
-            scale = np.sqrt(np.diag(self.P_w))
             if np.linalg.norm(delta_X_linear / self.tol_scale) <= self.nu:
-                print("Successfully converged!")
+                if print_vals:
+                    print("Successfully converged!")
                 self.converged = True
                 self.converged_i = i + 1
                 return
        
-        if not self.converged:
+        if not self.converged and print_vals:
             print("Converge unsuccessful")
     
     # Helper - clamp t1 between t0 and t1
     def _clamp_t1(self, t1):
-        floor, ceiling = self.t0 + self.time_split, self.t2 - self.time_split
+        margin = min(1e-6, 1e-6 * (self.t2 - self.t0))
+        floor, ceiling = self.t0 + margin, self.t2 - margin
         return float(np.clip(t1, floor, ceiling))
     
     # Helper - estimate errors

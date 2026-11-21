@@ -1,3 +1,9 @@
+# Second order STT LSM estimator for a single impulsive maneouvre. 
+# Equation numbers in the comments refer to Zhou et al.'s modified STT
+
+# project = True (use tangent plane)
+# project = False (3D LOS)
+
 import numpy as np
 from scipy.integrate import solve_ivp
 
@@ -26,7 +32,7 @@ def coe_to_eci(mu, a, e, i, raan, omega, nu):
 
     return r_eci, v_eci
 
-class PropagateSatelliteSecondMan():
+class PropagateSatelliteSecondManProj():
     # -- Constants --
     mu_e    = 398600.44    # km**3/s**2
     R_e     = 6378.137     # km
@@ -35,17 +41,17 @@ class PropagateSatelliteSecondMan():
     # -- Dimensions -- 
     STATE_DIM       = 6     # dynamical state [r, v]
     PARAM_DIM       = 10    # estimation vector [r, v, dv1, t1]
-    # MEASUREMENT_DIM = 2     # azimuth, elevation
     MEASUREMENT_DIM = 3     # 3-component LOS vector
 
-    nu = 1e-3   # Convergence limit
-    i_max = 10  # Iteration limit
-
-    sigma_noise = 1e-5 # Noise during simulation point generation
-    R_meas = sigma_noise**2 * np.eye(MEASUREMENT_DIM)   # 2 x 2 measurement covariance matrix
-
-    tol_scale = np.array([10., 10., 10., 1e-3, 1e-3, 1e-3, 5e-3, 5e-3, 5e-3, 50.])
-
+    # -- Estimator settings --
+    nu = 1e-3                                             # convergence tolerance
+    sigma_noise = 1e-5                                    # LOS noise, 1-sigma
+    R_meas = sigma_noise**2 * np.eye(MEASUREMENT_DIM)     # 3 x 3 measurement covariance
+    tol_scale = np.array([10., 10., 10.,                  # r0, km
+                          1e-3, 1e-3, 1e-3,               # v0, km/s
+                          5e-3, 5e-3, 5e-3,               # dv, km/s
+                          50.])                           # t1, s
+    
     def __init__(self, 
                  num_measurement, 
                  time_split, 
@@ -57,76 +63,89 @@ class PropagateSatelliteSecondMan():
                  dv_truth=(0.010, 0.010, 0.010),   # km/s  (= 10 m/s per axis, Zhou)
                  dv_guess=(0.015, 0.015, 0.015),
                  t0 = 0,
-                 t2 = 1800,
-                 rdm_seed = 2,
+                 t2 = None,
+                 rdm_seed = 5,
                  record = True,
-                 j2_partials = True):
-
-        # if not (t0 < t1_truth < t2):
-        #     raise ValueError(f"t1_truth={t1_truth} outside arc [{t0}, {t2}]")
+                 j2_partials = True,
+                 project = True,
+                 i_max = 10):
         
         self.record = record
         self.time_split = time_split
         self.special_rec = []
         self.results = []
+        self.project = project
         random = np.random.default_rng(rdm_seed)
+        self.i_max = i_max
+        self.j2_partials = j2_partials
+        self.n_fallback = 0
 
-        self.atol_traj = 1e-9
+        # Absolute tolerances for [x, Phi, Psi] when integrating the STTs
         self.atol_stt = np.concatenate([
             np.full(self.STATE_DIM, 1e-9),
             np.full(self.STATE_DIM**2, 1e-9),
             np.full(self.STATE_DIM**3, 1e-8),
         ])
-        self.j2_partials = j2_partials
 
+        # -- Time grid --
         self.K = num_measurement + 1
-        self.t_eval = np.arange(0, (self.K) * time_split, time_split)
-        self.t0 = self.t_eval[0]
-        self.t2 = self.t_eval[-1]
+        self.t0 = float(t0)
+        self.t_eval = self.t0 + np.arange(self.K, dtype=float) * time_split
+        self.t2 = float(self.t_eval[-1])
+        if t2 is not None and not np.isclose(self.t2, float(t2), atol=1e-9, rtol=0):
+            raise ValueError("t2 must equal t0 + num_measurement * time_split")
+        if not (self.t0 < t1_truth < self.t2):
+            raise ValueError("t1_truth must lie strictly inside the observation arc")
 
         self.t1_truth = t1_truth
         self.dv_truth = np.asarray(dv_truth)
 
-        # Observer truth - no maneouvre
+        # -- Truth trajectories --
+        # Observer truth - no manoevure
         a_obs = (observer_coe[0] + self.R_e) / (1.0 + observer_coe[1])
         r_obs, v_obs = coe_to_eci(self.mu_e, a_obs, observer_coe[1], *np.deg2rad(observer_coe[2:]))
         self.observer = self.propagate_states(r_obs, v_obs)
 
-        # Target truth - with 
+        # Target truth - with manoevure
         a_tgt = (target_coe[0] + self.R_e) / (1.0 + target_coe[1])
         r_tgt, v_tgt = coe_to_eci(self.mu_e, a_tgt, target_coe[1], *np.deg2rad(target_coe[2:]))
         self.target = self.propagate_states(r_tgt, v_tgt, dv=self.dv_truth, t1=self.t1_truth)
 
-        self.X_0 = np.array(self.target[0] + [10, 10, 10, 1e-3, 1e-3, 1e-3])
-
-        # Simulated angle measurements with noise
+        # -- Simulated LOS measurements with noise --
+        # Noise is added per component and NOT renormalised (as in the paper).
         self.z_tau = np.zeros((self.K, self.MEASUREMENT_DIM))
         for i in range(self.K):
             self.z_tau[i] = self.state_to_losvec(self.target[i], self.observer[i])
             self.z_tau[i] += random.normal(0.0, self.sigma_noise, self.MEASUREMENT_DIM)
-
+            
         # Truth angle measurements 
         self.z_exp = np.zeros((self.K, self.MEASUREMENT_DIM))
 
+        # -- Initial guess --
         # Initial parameter estimation X_0
         # t1 in the middle 
+        self.X_0 = np.array(self.target[0] + [10, 10, 10, 1e-3, 1e-3, 1e-3])
         x0_init_guess = self.X_0
-
         if t1_guess is None:
             t1_guess = 0.5 * (self.t0 + self.t2)
         self.X_i = np.concatenate([x0_init_guess, np.asarray(dv_guess, float), [float(t1_guess)]])
+        self.X_i[9] = self._clamp_t1(self.X_i[9])
 
-        # feeds the weight matrix
+        # Covariance Matrix
         self.P_w      = P_0_init.copy()   
-        # reported uncertainty only, not iterated back
-        self.P_report = P_0_init.copy()
 
-        # Covariance matrix 
-        self.R_2 = self.sigma_noise**2 * np.eye(self.K * self.MEASUREMENT_DIM)
-        
         if self.record:
             self.results.append([0, *self.X_i])
 
+    # ------------------------------------------------------------------
+    # Measurement models
+    # ------------------------------------------------------------------        
+    # Turn r, v state to LOS vector
+    def state_to_losvec(self, x_target, x_observer):
+        rel = x_target[:3] - x_observer[:3]        
+        l = rel / np.linalg.norm(rel)
+        return l
+        
     # Turns r, v state vector into azimuth/elevation
     def state_to_aziel(self, x_target, x_observer):
         r_obs = x_observer[:3]
@@ -146,13 +165,44 @@ class PropagateSatelliteSecondMan():
         elevation = np.arcsin(np.clip(z / np.linalg.norm(rel_local), -1.0, 1.0))
 
         return np.array([azimuth, elevation])
+
+    # First order measurement Jacobian Eq. 32
+    def calculate_U(self, x_target, x_observer, epsilon = 1e-4):
+        U = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM))
+
+        # Perturb each state component
+        for i in range(3):  
+            dx = np.zeros(6)
+            dx[i] = epsilon
+
+            h_plus = self.state_to_losvec(x_target + dx, x_observer)
+            h_minus = self.state_to_losvec(x_target - dx, x_observer)
+
+            U[:, i] = (h_plus - h_minus) / (2 * epsilon)
+
+        return U
     
-    # Turn r, v state to LOS vector
-    def state_to_losvec(self, x_target, x_observer):
-        rel = x_target[:3] - x_observer[:3]        
-        l = rel / np.linalg.norm(rel)
-        return l
-        
+    # Second order measurement Jacobian and Hessian (Eq. 32)
+    def calculate_U_and_Q(self, x_target, x_observer):
+        rel = x_target[:3] - x_observer[:3]
+        rho = np.linalg.norm(rel)
+        l = rel / rho
+        I3 = np.eye(3)
+    
+        U = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM))
+        U[:, :3] = (I3 - np.outer(l, l)) / rho         
+    
+        Q = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM, self.STATE_DIM))
+        Q[:, :3, :3] = (3.0 * np.einsum('i,j,k->ijk', l, l, l)
+                        - np.einsum('ij,k->ijk', I3, l)
+                        - np.einsum('ik,j->ijk', I3, l)
+                        - np.einsum('jk,i->ijk', I3, l)) / rho**2
+        return U, Q
+
+    # ------------------------------------------------------------------
+    # Dynamics and state transition tensors
+    # ------------------------------------------------------------------
+
     # J2 dynamics-inclusive dynamics for spacecraft
     def dynamics(self, t, state):
         r = state[:3]
@@ -256,6 +306,7 @@ class PropagateSatelliteSecondMan():
             states[~pre] = sol2.y.T
         return states
 
+    # Propagate reference trajectory for estimate X and build MSTT
     def propagate_stt(self, X):
         r0 = X[:3]
         v0 = X[3:6]
@@ -270,6 +321,9 @@ class PropagateSatelliteSecondMan():
         y0_s1 = np.concatenate([r0, v0, I6.ravel(), Z666.ravel()])
         te1 = np.unique(np.append(self.t_eval[pre], t1))
         sol1 = solve_ivp(self.combined_dynamics_stt, [self.t0, t1], y0_s1, t_eval=te1, rtol=1e-9, atol=self.atol_stt, method='DOP853')
+        if not sol1.success or sol1.y.shape[1] != te1.size:
+            raise RuntimeError(f"Segment 1 integration failed: {sol1.message}")
+        
         end1 = sol1.y[:, -1]
         i_stm = self.STATE_DIM + self.STATE_DIM**2
 
@@ -289,7 +343,9 @@ class PropagateSatelliteSecondMan():
         y0_s2 = np.concatenate([x1_plus, I6.flatten(), Z666.flatten()])
         te2 = self.t_eval[~pre]                   
         sol2 = solve_ivp(self.combined_dynamics_stt, [t1, self.t2], y0_s2, t_eval=te2, rtol=1e-9, atol=self.atol_stt, method='DOP853')
-
+        if not sol2.success or sol2.y.shape[1] != te2.size:
+            raise RuntimeError(f"Segment 2 integration failed: {sol2.message}")
+       
         # maneouvre terms of segment 2
         f_plus = self.dynamics(t1, x1_plus)
         H_plus = self.calc_first_diff(x1_plus)
@@ -307,12 +363,10 @@ class PropagateSatelliteSecondMan():
         Phi_mod = np.zeros((self.K, self.STATE_DIM, self.PARAM_DIM))
         Psi_mod = np.zeros((self.K, self.STATE_DIM, self.PARAM_DIM, self.PARAM_DIM))
 
-        # CHECK IF THIS IS RIGHT
         i1 = 0
         i2 = 0                   
         for k, t in enumerate(self.t_eval):
             if t <= t1:
-                # CHECK IF THIS IS RIGHT sol1.sol(t)
                 s = sol1.y[:, i1]
                 i1 += 1
                 states[k] = s[:self.STATE_DIM]
@@ -352,41 +406,26 @@ class PropagateSatelliteSecondMan():
                 Psi_mod[k, :, 9, 6:9] = O
 
         return states, Phi_mod, Psi_mod
+
     
-    # Measurement Jacobian Eq. 32
-    def calculate_U(self, x_target, x_observer, epsilon = 1e-4):
-        U = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM))
+    # ------------------------------------------------------------------
+    # Estimator
+    # ------------------------------------------------------------------
+    # Helper - Make Projection Basis (tangent plane)
+    def _projection_basis(self):
+        T = np.zeros((self.K, 3, 2))
+        for k in range(self.K):
+            l = self.z_exp[k]
+            e = np.array([0, 0, 1.]) if abs(l[2]) < 0.9 else np.array([1., 0, 0])
+            a = np.cross(l, e)
+            a /= np.linalg.norm(a)
+            T[k] = np.stack([a, np.cross(l, a)], axis=1)
+        return T
 
-        for i in range(3):  # Perturb each state component
-            dx = np.zeros(6)
-            dx[i] = epsilon
-
-            h_plus = self.state_to_losvec(x_target + dx, x_observer)
-            h_minus = self.state_to_losvec(x_target - dx, x_observer)
-
-            U[:, i] = (h_plus - h_minus) / (2 * epsilon)
-
-        return U
-    
-    # Second order measurement Jacobian (Eq. 32)
-    def calculate_U_and_Q(self, x_target, x_observer):
-        rel = x_target[:3] - x_observer[:3]
-        rho = np.linalg.norm(rel)
-        l = rel / rho
-        I3 = np.eye(3)
- 
-        U = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM))
-        U[:, :3] = (I3 - np.outer(l, l)) / rho         
- 
-        Q = np.zeros((self.MEASUREMENT_DIM, self.STATE_DIM, self.STATE_DIM))
-        Q[:, :3, :3] = (3.0 * np.einsum('i,j,k->ijk', l, l, l)
-                        - np.einsum('ij,k->ijk', I3, l)
-                        - np.einsum('ik,j->ijk', I3, l)
-                        - np.einsum('jk,i->ijk', I3, l)) / rho**2
-        return U, Q
-
+    # Run second order iterative estimator
     def do_calc(self, print_vals=True):
         self.converged = False          
+        self.diverged = False
         self.converged_i = 0
 
         # Print initial guess
@@ -397,11 +436,9 @@ class PropagateSatelliteSecondMan():
             print(f"{'Initial guess':<14}" + "".join(f"{v:>10.4f}" for v in self._error_row(self.X_i)))
             
         for i in range(self.i_max):
-            # print("iterating")
             # Propagate reference orbit and obtain STT
             self.expected_points, phi, psi = self.propagate_stt(self.X_i)
             
-            # print("predicting measurements")
             # Predicted measurements
             for j in range(self.K):
                 self.z_exp[j] = self.state_to_losvec(self.expected_points[j], self.observer[j])
@@ -422,43 +459,53 @@ class PropagateSatelliteSecondMan():
 
             # Find difference in recorded and propagated azimuth/range measurements
             delta_z = (self.z_tau - self.z_exp).reshape((self.K * self.MEASUREMENT_DIM))
-            
-            # Calculate Weight Matrix W = (Omega P Omega^T + R)^-1 (Eq. 50)
-            W = np.zeros((self.K * self.MEASUREMENT_DIM, self.K * self.MEASUREMENT_DIM))
-            md = self.MEASUREMENT_DIM
 
+            # Project 3D residual and sensitivities 
+            if self.project:
+                T = self._projection_basis()
+                Xi = np.einsum('tia,tip->tap',   T, Xi) # K x 2 x 10
+                Theta = np.einsum('tia,tipq->tapq', T, Theta) # K x 2 x 10 x 10 
+                delta_z = np.einsum('tia,ti->ta', T, self.z_tau - self.z_exp).ravel() 
+                R_k = self.sigma_noise**2 * np.eye(2)  # replaces self.R_meas in W
+                md = 2 # use 2 instead of MEASUREMENT_DIM below
+            else:
+                R_k = self.R_meas
+                md = self.MEASUREMENT_DIM
+
+            # Calculate Weight Matrix W = (Omega P Omega^T + R)^-1 (Eq. 50)
+            W = np.zeros((self.K * md, self.K * md))
             M = np.einsum('tiab,bc->tiac', Theta, self.P_w)
             for k in range(self.K):
                 first = Xi[k] @ self.P_w @ Xi[k].T
-                second = 0.5 * np.einsum('iac,jca->ij',  M[k], M[k])     # tr(Theta_i P Theta_j P)
+                second = 0.5 * np.einsum('iac,jca->ij',  M[k], M[k])
 
-                P_k = first + second + self.R_meas
+                P_k = first + second + R_k
                 W[k * md:k * md + md, k * md:k * md + md] = P_k
 
+            # Normalise Weight Matrix W
             W = np.linalg.pinv(W)
             W = W / np.linalg.norm(W)
 
-            # print("estimator step")
             # Estimator Step (Eq.44) 
-            Omega = Xi.reshape(self.K * self.MEASUREMENT_DIM, self.PARAM_DIM)
-            Sigma = Theta.reshape(self.K * self.MEASUREMENT_DIM, self.PARAM_DIM, self.PARAM_DIM)
+            Omega = Xi.reshape(self.K * md, self.PARAM_DIM)
+            Sigma = Theta.reshape(self.K * md, self.PARAM_DIM, self.PARAM_DIM)
 
             self.W_final = W
             self.Omega_final = Omega
             self.Sigma_final = Sigma
 
-            # First order
-            # scaling: km, km/s, s
+            # First order step (Eq. 44)
             S = self.tol_scale                                  
             H_lin = Omega.T @ W @ Omega
             b_lin = Omega.T @ W @ delta_z
-            delta_X_linear = S * np.linalg.solve(H_lin * np.outer(S, S), S * b_lin)
+            H_scaled = H_lin * np.outer(S, S)
+            delta_X_linear = S * np.linalg.lstsq(H_scaled, S * b_lin, rcond=1e-14)[0]
 
             # Second order step (Eq. 56)
             Gamma_bar = Omega + np.einsum('ikp,p->ik', Sigma, delta_X_linear)
             GtW = Gamma_bar.T @ W                               
 
-            # Eqs. 59-60 
+            # Eq. 59-60 
             Omega_bar = GtW @ Omega                             
             dZ_bar    = GtW @ delta_z                          
 
@@ -472,64 +519,38 @@ class PropagateSatelliteSecondMan():
             corr = S * np.linalg.solve(Ob_s, S * s_uu)
             dX_hat = u - 0.5 * corr
 
-            # if the curvature term is large, take the first order step instead
-            if np.linalg.norm(0.5 * corr / S) > 0.5 * np.linalg.norm(u / S):
-                dX_hat = delta_X_linear
-
-            # # First order
-            # H_lin = Omega.T @ W @ Omega
-            # b_lin = Omega.T @ W @ delta_z
-            # delta_X_linear = np.linalg.lstsq(H_lin, b_lin, rcond=None)[0]
-
-            # # Gamma_lin = Omega + np.einsum('ikp,p->ik', Sigma, delta_X_linear)
-            # # GtW       = Gamma_lin.T @ W
-            # # dZ_lin    = -2.0 * (GtW @ delta_z)
-            # # Omega_lin = -2.0 * (GtW @ Omega)
-            # # Sigma_lin = -2.0 * np.einsum('ij,jmn->imn', GtW, Sigma) 
-
-            # # Series Reversion (Eq. 62) (second order approx)
-            # corr   = np.einsum('ijk,j,k->i', Sigma, delta_X_linear, delta_X_linear)
-            # dX_hat = delta_X_linear - 0.5 * np.linalg.lstsq(H_lin, Omega.T @ W @ corr, rcond=None)[0]
-            # Gamma_lin = Omega + np.einsum('ikp,p->ik', Sigma, dX_hat)   # for the covariance update
-
-            # dx1 = np.linalg.lstsq(Omega_lin, dZ_lin, rcond=None)[0]
-            # # kron_dx1 = np.kron(dx1, dx1)
-            # # Sigma_lin_2d = Sigma_lin.reshape(Sigma_lin.shape[0], -1)
-            # # corr = Sigma_lin_2d @ kron_dx1
-            # # dX_hat = dx1 - 0.5 * np.linalg.lstsq(Omega_lin, corr, rcond=None)[0]
-
-            # corr = np.einsum('ijk,j,k->i', Sigma_lin, dx1, dx1)
-            # dX_hat = dx1 - 0.5 * np.linalg.lstsq(Omega_lin, corr, rcond=None)[0]
-            # dX_hat = dx1 - 0.5 * np.linalg.lstsq(H_lin, Omega.T @ W @ np.einsum('ijk,j,k->i', Sigma, dx1, dx1), rcond=1)[0]
-
-            # Clamp
-            # Using std from P_0_init
-            # otherwise sparse-case has / 0 problem
-            # scale_step = np.array([10.0, 10.0, 10.0, 1e-3, 1e-3, 1e-3, 5e-3, 5e-3, 5e-3, 50.0])
-            # step_magnitude = np.linalg.norm(dX_hat / scale_step)
-            # max_step_magnitude = 10.0
-
-            # if step_magnitude > max_step_magnitude:
-            #     dX_hat = dX_hat * (max_step_magnitude / step_magnitude)
-
             # Parameter update 
             self.X_i = self.X_i + dX_hat
             self.X_i[9] = self._clamp_t1(self.X_i[9])
 
+            # Check Divergence
+            r_norm = np.linalg.norm(self.X_i[:3])
+            v_norm = np.linalg.norm(self.X_i[3:6])
+            if (not np.all(np.isfinite(self.X_i))) or r_norm > 1e6 or v_norm > 50.0:
+                self.diverged = True
+                self.diverged_i = i + 1
+                if print_vals:
+                    print(f"Diverged at iteration {i + 1} (|r|={r_norm:.3e} km, |v|={v_norm:.3e} km/s)")
+                return
+
             # Covariance update
-            # self.P_i = np.linalg.pinv(Gamma_lin.T @ W @ Omega) @ Gamma_lin.T @ W @ self.R_2 @ W.T @ Gamma_lin @ np.linalg.pinv(Omega.T @ W @ Gamma_lin)
-            # self.P_i = 0.5 * (self.P_i + self.P_i.T)
+            S = self.tol_scale
+            Om_s, Gb_s = Omega * S, Gamma_bar * S
+            SS = np.outer(S, S)
 
-            Hinv = np.linalg.pinv(Omega.T @ W @ Omega)
-            self.P_w = Hinv @ Omega.T @ W @ self.R_2 @ W.T @ Omega @ Hinv
-            self.P_w = 0.5 * (self.P_w + self.P_w.T)
+            A_lin = Om_s.T @ W @ Om_s
+            L_s = np.linalg.pinv(A_lin) @ (Om_s.T @ W)
+            P_lin = self.sigma_noise**2 * (L_s @ L_s.T) * SS
 
-            Gamma_bar = Omega + np.einsum('ikp,p->ik', Sigma, delta_X_linear)
-            self.P_report = (np.linalg.pinv(Gamma_bar.T @ W @ Omega)
-                            @ Gamma_bar.T @ W @ self.R_2 @ W.T @ Gamma_bar
-                            @ np.linalg.pinv(Omega.T @ W @ Gamma_bar))
-            self.P_report = 0.5 * (self.P_report + self.P_report.T)
-            
+            A_2nd = Gb_s.T @ W @ Om_s
+
+            M_s = np.linalg.solve(A_2nd, Gb_s.T @ W)
+            P_2nd = self.sigma_noise**2 * (M_s @ M_s.T) * SS
+
+            self.P_lin = P_lin
+            self.P_2nd = P_2nd
+            self.P_w = P_2nd
+
             # Record the iteration and difference in current estimated X_0 and actual initial guess
             if self.record:
                 self.results.append([i + 1, *self.X_i])
@@ -540,19 +561,24 @@ class PropagateSatelliteSecondMan():
                 print(f"{label:<14}" + "".join(f"{v:>10.4f}" for v in self._error_row(self.X_i)))
 
             # Convergence check
-            scale = np.sqrt(np.diag(self.P_w))
             if np.linalg.norm(dX_hat / self.tol_scale) <= self.nu:
-                print("Successfully converged!")
+                if print_vals:
+                    print("Successfully converged!")
                 self.converged = True
                 self.converged_i = i + 1
                 return
        
-        if not self.converged:
+        if not self.converged and print_vals:
             print("Converge unsuccessful")
-    
-    # Helper - clamp t1 between t0 and t1
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    # Helper - clamp t1 between t0 and t2
     def _clamp_t1(self, t1):
-        floor, ceiling = self.t0 + self.time_split, self.t2 - self.time_split
+        margin = min(1e-6, 1e-6 * (self.t2 - self.t0))
+        floor, ceiling = self.t0 + margin, self.t2 - margin
         return float(np.clip(t1, floor, ceiling))
 
     # Helper -  Calculate dadr J2
@@ -623,6 +649,3 @@ class PropagateSatelliteSecondMan():
             (X[8] - self.dv_truth[2]) * 1e3,          # dvz    m/s
             X[9] - self.t1_truth,                     # t1     s
         ])
-
-
-     
